@@ -32,7 +32,7 @@ import { Log } from "meteor/logging";
 
 // since we'll be at version 0 by default, we should have a migration set for
 // it.
-const DefaultMigration = { version: 0, up: function () {} };
+const DefaultMigration = { async: false, version: 0, up: function () {} };
 
 export const Migrations = {
   _list: [DefaultMigration],
@@ -110,6 +110,11 @@ Meteor.startup(function () {
 //  name: String *optional
 // }
 Migrations.add = function (migration) {
+  if (typeof migration.async !== "boolean")
+    throw new Meteor.Error(
+      "Migration must be async or not. Async migrations await for finishing async up and down functions."
+    );
+
   if (typeof migration.up !== "function")
     throw new Meteor.Error("Migration must supply an up function.");
 
@@ -126,36 +131,6 @@ Migrations.add = function (migration) {
   this._list = _.sortBy(this._list, function (m) {
     return m.version;
   });
-};
-
-// Attempts to run the migrations using command in the form of:
-// e.g 'latest', 'latest,exit', 2
-// use 'XX,rerun' to re-run the migration at that version
-Migrations.migrateTo = function (command) {
-  if (
-    typeof command === "undefined" ||
-    command === "" ||
-    this._list.length === 0
-  )
-    throw new Error("Cannot migrate using invalid command: " + command);
-
-  let version;
-  let subcommand;
-  if (typeof command === "number") {
-    version = command;
-  } else {
-    version = command.split(",")[0]; //.trim();
-    subcommand = command.split(",")[1]; //.trim();
-  }
-
-  if (version === "latest") {
-    this._migrateTo(this._list[this._list.length - 1].version);
-  } else {
-    this._migrateTo(parseInt(version), subcommand === "rerun");
-  }
-
-  // remember to run meteor with --once otherwise it will restart
-  if (subcommand === "exit") process.exit(0);
 };
 
 // Attempts to run the migrations using command in the form of:
@@ -199,131 +174,6 @@ Migrations.getVersionAsync = async function () {
   return result.version;
 };
 
-// migrates to the specific version passed in
-Migrations._migrateTo = function (version, rerun) {
-  const self = this;
-  const control = this._getControl(); // Side effect: upserts control document.
-  let currentVersion = control.version;
-
-  //Avoid unneeded locking, check if migration actually is going to run
-  if (!rerun && currentVersion === version) {
-    if (Migrations.options.logIfLatest) {
-      log.info("Not migrating, already at version " + version);
-    }
-    return;
-  }
-
-  if (lock() === false) {
-    log.info("Not migrating, control is locked.");
-    return;
-  }
-
-  if (rerun) {
-    log.info("Rerunning version " + version);
-    migrate("up", this._findIndexByVersion(version));
-    log.info("Finished migrating.");
-    unlock();
-    return;
-  }
-
-  const startIdx = this._findIndexByVersion(currentVersion);
-  const endIdx = this._findIndexByVersion(version);
-
-  // log.info('startIdx:' + startIdx + ' endIdx:' + endIdx);
-  log.info(
-    "Migrating from version " +
-      this._list[startIdx].version +
-      " -> " +
-      this._list[endIdx].version
-  );
-
-  // run the actual migration
-  function migrate(direction, idx) {
-    const migration = self._list[idx];
-
-    if (typeof migration[direction] !== "function") {
-      unlock();
-      throw new Meteor.Error(
-        "Cannot migrate " + direction + " on version " + migration.version
-      );
-    }
-
-    function maybeName() {
-      return migration.name ? " (" + migration.name + ")" : "";
-    }
-
-    log.info(
-      "Running " +
-        direction +
-        "() on version " +
-        migration.version +
-        maybeName()
-    );
-
-    migration[direction](migration);
-  }
-
-  // Returns true if lock was acquired.
-  function lock() {
-    // This is atomic. The selector ensures only one caller at a time will see
-    // the unlocked control, and locking occurs in the same update's modifier.
-    // All other simultaneous callers will get false back from the update.
-    return (
-      self._collection.update(
-        { _id: "control", locked: false },
-        { $set: { locked: true, lockedAt: new Date() } }
-      ) === 1
-    );
-  }
-
-  async function lockAsync() {
-    // This is atomic. The selector ensures only one caller at a time will see
-    // the unlocked control, and locking occurs in the same update's modifier.
-    // All other simultaneous callers will get false back from the update.
-    const result =
-      (await self._collection.updateAsync(
-        { _id: "control", locked: false },
-        { $set: { locked: true, lockedAt: new Date() } }
-      )) === 1;
-    return result;
-  }
-
-  // Side effect: saves version.
-  function unlock() {
-    self._setControl({ locked: false, version: currentVersion });
-  }
-
-  // Side effect: saves version.
-  async function unlockAsync() {
-    await self._setControlAsync({ locked: false, version: currentVersion });
-  }
-
-  function updateVersion() {
-    self._setControl({ locked: true, version: currentVersion });
-  }
-
-  async function updateVersionAsync() {
-    await self._setControlAsync({ locked: true, version: currentVersion });
-  }
-
-  if (currentVersion < version) {
-    for (let i = startIdx; i < endIdx; i++) {
-      migrate("up", i + 1);
-      currentVersion = self._list[i + 1].version;
-      updateVersion();
-    }
-  } else {
-    for (let i = startIdx; i > endIdx; i--) {
-      migrate("down", i);
-      currentVersion = self._list[i - 1].version;
-      updateVersion();
-    }
-  }
-
-  unlock();
-  log.info("Finished migrating.");
-};
-
 Migrations._migrateToAsync = async function (version, rerun) {
   const self = this;
   const control = await this._getControlAsync(); // Side effect: upserts control document.
@@ -344,7 +194,7 @@ Migrations._migrateToAsync = async function (version, rerun) {
 
   if (rerun) {
     log.info("Rerunning version " + version);
-    await migrateAsync("upAsync", this._findIndexByVersion(version));
+    await migrateAsync("up", this._findIndexByVersion(version));
     log.info("Finished migrating.");
     await unlockAsync();
     return;
@@ -384,7 +234,11 @@ Migrations._migrateToAsync = async function (version, rerun) {
         maybeName()
     );
 
-    migration[direction](migration);
+    if (migration.async) {
+      await migration[direction](migration);
+    } else {
+      migration[direction](migration);
+    }
   }
 
   async function lockAsync() {
@@ -410,13 +264,13 @@ Migrations._migrateToAsync = async function (version, rerun) {
 
   if (currentVersion < version) {
     for (let i = startIdx; i < endIdx; i++) {
-      await migrateAsync("upAsync", i + 1);
+      await migrateAsync("up", i + 1);
       currentVersion = self._list[i + 1].version;
       await updateVersionAsync();
     }
   } else {
     for (let i = startIdx; i > endIdx; i--) {
-      await migrateAsync("downAsync", i);
+      await migrateAsync("down", i);
       currentVersion = self._list[i - 1].version;
       await updateVersionAsync();
     }
