@@ -110,11 +110,6 @@ Meteor.startup(function () {
 //  name: String *optional
 // }
 Migrations.add = function (migration) {
-  if (typeof migration.async !== "boolean")
-    throw new Meteor.Error(
-      "Migration must be async or not. Async migrations await for finishing async up and down functions."
-    );
-
   if (typeof migration.up !== "function")
     throw new Meteor.Error("Migration must supply an up function.");
 
